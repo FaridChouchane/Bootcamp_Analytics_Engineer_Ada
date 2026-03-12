@@ -147,51 +147,968 @@ mon_projet_dbt/
 └── .gitignore                  # Fichiers à exclure de Git
 ```
 
-### 2.2 Explication de chaque élément
+### 2.2 Explication détaillée de chaque élément
+
+---
 
 #### `models/` — Le cœur du projet
 
-Chaque fichier `.sql` dans ce dossier est un **modèle**. Un modèle est une instruction `SELECT` que dbt matérialise dans le warehouse (en tant que view, table, etc.).
+Le dossier `models/` contient l'ensemble de vos transformations SQL. Chaque fichier `.sql` est un **modèle**. Un modèle est fondamentalement une instruction `SELECT` — rien de plus. C'est dbt qui se charge d'envelopper ce `SELECT` dans le DDL approprié (`CREATE VIEW AS ...`, `CREATE TABLE AS ...`, etc.) selon la matérialisation que vous avez configurée.
 
-La convention recommandée par dbt Labs organise les modèles en trois couches :
+**Mécanisme interne** : quand vous lancez `dbt run`, voici ce qui se passe pour chaque modèle :
 
-- **`staging/`** : un modèle par source. Renomme les colonnes, corrige les types, filtre les données invalides. Préfixe : `stg_`.
-- **`intermediate/`** : combine et enrichit les modèles staging. Logique métier intermédiaire. Préfixe : `int_`.
-- **`marts/`** : modèles finaux prêts pour la BI. Organisés par domaine métier. Préfixes : `fct_` (tables de faits) et `dim_` (tables de dimensions).
+1. dbt lit le fichier `.sql`
+2. Il résout tout le Jinja (les `{{ ref() }}`, `{{ source() }}`, les conditions `{% if %}`, etc.)
+3. Il obtient du SQL pur
+4. Il enveloppe ce SQL dans un DDL selon la matérialisation (`CREATE VIEW AS select ...` ou `CREATE TABLE AS select ...`)
+5. Il envoie ce DDL au warehouse pour exécution
+6. Le warehouse crée l'objet (vue, table, etc.)
+
+**Ordre d'exécution** : dbt ne lance pas les modèles dans l'ordre alphabétique. Il analyse tous les appels `ref()` pour construire un **DAG** (Directed Acyclic Graph) — un graphe de dépendances — puis exécute les modèles dans l'ordre topologique. Si `fct_revenue` appelle `{{ ref('stg_orders') }}`, dbt garantit que `stg_orders` sera exécuté avant `fct_revenue`.
+
+**La convention en 3 couches** recommandée par dbt Labs organise les modèles de manière à séparer les responsabilités :
+
+##### Couche 1 : `staging/` — Le nettoyage des sources
+
+```
+models/
+  staging/
+    _stg_sources.yml          # déclaration des sources
+    _stg_schema.yml           # documentation et tests
+    stg_orders.sql            # 1 modèle = 1 source table
+    stg_customers.sql
+    stg_products.sql
+```
+
+**Rôle** : chaque modèle staging correspond à **exactement une table source**. C'est une couche de nettoyage et de normalisation. Le staging est la seule couche qui touche directement aux sources — toutes les couches suivantes travaillent sur des modèles staging via `ref()`.
+
+**Ce que fait un modèle staging** :
+- Renomme les colonnes (ex : `usr_id` → `customer_id`) pour avoir des noms lisibles et cohérents
+- Corrige les types de données (ex : `cast(amount as decimal(10,2))`)
+- Filtre les données invalides évidentes (ex : montants négatifs, dates dans le futur)
+- Sélectionne explicitement les colonnes utiles (pas de `select *` en sortie finale)
+- Ne fait **aucune** jointure et **aucun** calcul métier — c'est le rôle des couches suivantes
+
+**Conventions** :
+- Préfixe : `stg_`
+- Un modèle par table source
+- Matérialisation : `view` (toujours à jour, pas de coût de stockage)
+- Jamais de jointure entre sources dans cette couche
+
+```sql
+-- models/staging/stg_orders.sql
+-- Exemple type d'un modèle staging
+
+{{
+  config(
+    materialized='view'                -- view car c'est du staging
+  )
+}}
+
+with source as (
+
+    -- Lecture de la source brute (la seule couche qui utilise source())
+    select * from {{ source('ecommerce', 'orders') }}
+
+),
+
+renamed as (
+
+    select
+        -- Renommage explicite de chaque colonne
+        id              as order_id,
+        usr_id          as customer_id,
+        ord_date        as order_date,
+        sts             as order_status,
+        amt             as amount_cents,       -- on garde les centimes ici
+        pay_type        as payment_type_code,
+        created         as created_at,
+        updated         as updated_at
+    from source
+
+),
+
+filtered as (
+
+    select *
+    from renamed
+    where
+        order_id is not null            -- exclure les lignes sans ID
+        and amount_cents >= 0           -- exclure les montants aberrants
+        and order_date >= '2020-01-01'  -- exclure les dates trop anciennes
+
+)
+
+select * from filtered
+```
+
+##### Couche 2 : `intermediate/` — La logique métier intermédiaire
+
+```
+models/
+  intermediate/
+    _int_schema.yml
+    int_orders_enriched.sql       # jointure commandes + clients
+    int_daily_revenue.sql         # agrégation journalière
+    int_customer_orders.sql       # métriques par client
+```
+
+**Rôle** : les modèles intermédiaires combinent, enrichissent et transforment les données provenant du staging. Ils contiennent la logique métier qui serait trop complexe pour un seul modèle mart mais qui n'a pas vocation à être exposée directement à la BI.
+
+**Ce que fait un modèle intermediate** :
+- Jointures entre modèles staging (ex : commandes + clients + produits)
+- Calculs métier complexes (ex : fenêtres d'analyse, scoring, classification)
+- Agrégations intermédiaires
+- Dénormalisation de données pour préparer les marts
+
+**Conventions** :
+- Préfixe : `int_`
+- Matérialisation : `view` ou `ephemeral` (pas besoin de les persister en général)
+- Les utilisateurs BI ne requêtent jamais directement cette couche
+- Un modèle intermédiaire peut référencer des modèles staging ET d'autres intermédiaires
+
+```sql
+-- models/intermediate/int_orders_enriched.sql
+-- Jointure entre commandes et clients pour enrichir les données
+
+with orders as (
+
+    select * from {{ ref('stg_orders') }}         -- source : staging
+
+),
+
+customers as (
+
+    select * from {{ ref('stg_customers') }}      -- source : staging
+
+),
+
+products as (
+
+    select * from {{ ref('stg_products') }}       -- source : staging
+
+),
+
+enriched as (
+
+    select
+        o.order_id,
+        o.order_date,
+        o.amount_cents,
+
+        -- Enrichissement depuis la table clients
+        c.customer_name,
+        c.customer_segment,
+        c.signup_date,
+
+        -- Enrichissement depuis la table produits
+        p.product_name,
+        p.product_category,
+
+        -- Calcul métier : rang de la commande pour chaque client
+        row_number() over (
+            partition by o.customer_id
+            order by o.order_date
+        ) as order_sequence_number,
+
+        -- Calcul métier : est-ce la première commande ?
+        case
+            when row_number() over (
+                partition by o.customer_id
+                order by o.order_date
+            ) = 1 then true
+            else false
+        end as is_first_order
+
+    from orders o
+    left join customers c on o.customer_id = c.customer_id
+    left join products p on o.product_id = p.product_id
+
+)
+
+select * from enriched
+```
+
+##### Couche 3 : `marts/` — Les modèles prêts pour la BI
+
+```
+models/
+  marts/
+    finance/                     # domaine métier : finance
+      _finance_schema.yml
+      fct_revenue.sql            # table de faits : revenu
+      fct_invoices.sql           # table de faits : factures
+      dim_customers.sql          # table de dimension : clients
+    marketing/                   # domaine métier : marketing
+      _marketing_schema.yml
+      fct_campaigns.sql
+      fct_conversions.sql
+    product/                     # domaine métier : produit
+      _product_schema.yml
+      fct_usage_events.sql
+      dim_features.sql
+```
+
+**Rôle** : les marts sont les modèles finaux, exposés aux utilisateurs BI et aux outils de visualisation (Looker, Metabase, Power BI, Tableau). Ils doivent être optimisés pour la lecture et organisés par **domaine métier**, pas par source de données.
+
+**Ce que fait un modèle mart** :
+- Agrégation finale des données
+- Structure adaptée aux requêtes BI (schéma en étoile : faits + dimensions)
+- Documentation exhaustive (chaque colonne doit être documentée car les utilisateurs finaux les consultent)
+
+**Conventions** :
+- Préfixes : `fct_` pour les tables de faits, `dim_` pour les tables de dimensions
+- Matérialisation : `table` ou `incremental` (les outils BI requêtent directement ces tables — elles doivent être rapides)
+- Organisés par domaine métier (finance, marketing, produit) et non par source
+- Documentation et tests exhaustifs car c'est la couche visible
+
+**Tables de faits vs dimensions** :
+- **Faits** (`fct_`) : événements, transactions, mesures. Contiennent des métriques numériques et des clés étrangères vers les dimensions. Ex : `fct_revenue`, `fct_orders`, `fct_page_views`.
+- **Dimensions** (`dim_`) : entités de référence. Contiennent les attributs descriptifs. Ex : `dim_customers`, `dim_products`, `dim_dates`.
+
+```sql
+-- models/marts/finance/fct_revenue.sql
+-- Table de faits : revenu par commande, prête pour la BI
+
+{{
+  config(
+    materialized='table',            -- table car requêté directement par la BI
+    tags=['finance', 'daily']
+  )
+}}
+
+with orders as (
+
+    select * from {{ ref('int_orders_enriched') }}    -- source : intermediate
+
+),
+
+final as (
+
+    select
+        -- Clés
+        order_id,
+        customer_id,
+
+        -- Dimensions (clés étrangères)
+        customer_segment,
+        product_category,
+
+        -- Métriques / faits
+        amount_cents / 100.0 as amount_euros,
+        is_first_order,
+        order_sequence_number,
+
+        -- Temporalité
+        order_date,
+        date_trunc('month', order_date) as order_month,
+        date_trunc('quarter', order_date) as order_quarter
+
+    from orders
+    where order_status = 'completed'       -- uniquement les commandes finalisées
+
+)
+
+select * from final
+```
+
+**Pourquoi cette organisation en 3 couches ?**
+
+| Avantage | Explication |
+|----------|------------|
+| **Lisibilité** | Chaque modèle a une responsabilité claire et limitée |
+| **Maintenabilité** | Un changement de source n'impacte que le staging, pas les marts |
+| **Testabilité** | On peut tester chaque couche indépendamment |
+| **Performance** | On peut matérialiser différemment chaque couche (view staging, table marts) |
+| **Collaboration** | Un analytics engineer peut travailler sur un mart sans toucher au staging |
+| **Réutilisabilité** | Un même modèle staging peut alimenter plusieurs marts de domaines différents |
+
+**Le flux de données** :
+
+```
+Sources brutes (warehouse)
+        │
+        ▼
+   ┌─────────┐
+   │ staging  │  ← source()  ← 1:1 avec les tables sources
+   │ stg_*    │  ← renommage, typage, filtrage basique
+   └────┬─────┘
+        │ ref()
+        ▼
+   ┌──────────────┐
+   │ intermediate │  ← jointures, enrichissement, calculs
+   │ int_*        │  ← logique métier intermédiaire
+   └────┬─────────┘
+        │ ref()
+        ▼
+   ┌─────────┐
+   │  marts  │  ← agrégations finales, schéma en étoile
+   │ fct_*   │  ← optimisé pour la BI
+   │ dim_*   │  ← documenté pour les utilisateurs finaux
+   └─────────┘
+        │
+        ▼
+   Outils BI (Looker, Metabase, Power BI...)
+```
+
+---
 
 #### `macros/` — Fonctions réutilisables
 
-Les macros sont des fonctions écrites en Jinja. Elles permettent de factoriser de la logique SQL répétitive. dbt fournit des macros intégrées et vous pouvez créer les vôtres.
+```
+macros/
+  generate_schema_name.sql     # surcharge de la macro native dbt
+  cents_to_euros.sql           # conversion de devises
+  safe_divide.sql              # division sécurisée (évite le /0)
+  limit_for_ci.sql             # limitation des données en CI
+  drop_ci_schemas.sql          # nettoyage des schemas de CI
+```
 
-#### `tests/` — Tests singuliers
+**Rôle** : les macros sont des **fonctions Jinja réutilisables**. Elles permettent de factoriser de la logique SQL qu'on retrouverait en doublon dans plusieurs modèles. Pensez-y comme des fonctions dans un langage de programmation classique.
 
-Contient des requêtes SQL qui retournent les lignes qui échouent au test. Un test passe si la requête retourne 0 ligne.
+**Mécanisme interne** : une macro est définie dans un fichier `.sql` du dossier `macros/` avec la syntaxe `{% macro nom(params) %}...{% endmacro %}`. Elle est ensuite appelable depuis n'importe quel modèle, test ou autre macro avec `{{ nom(params) }}`. Au moment de la compilation, dbt remplace l'appel par le contenu de la macro.
+
+**Trois catégories de macros** :
+
+1. **Macros utilitaires** : logique SQL réutilisable dans vos modèles.
+
+```sql
+-- macros/safe_divide.sql
+{% macro safe_divide(numerator, denominator, default_value=0) %}
+    case
+        when {{ denominator }} is null or {{ denominator }} = 0
+        then {{ default_value }}
+        else cast({{ numerator }} as decimal) / nullif({{ denominator }}, 0)
+    end
+{% endmacro %}
+
+-- Appel dans un modèle :
+-- select {{ safe_divide('revenue', 'order_count') }} as avg_order_value
+-- Compilé en →
+-- select case when order_count is null or order_count = 0
+--        then 0 else cast(revenue as decimal) / nullif(order_count, 0) end
+--        as avg_order_value
+```
+
+2. **Macros de surcharge** : remplacent le comportement natif de dbt. La plus courante est `generate_schema_name` qui contrôle comment dbt nomme les schemas dans le warehouse.
+
+```sql
+-- macros/generate_schema_name.sql
+-- Si vous ne surchargez pas cette macro, dbt ajoute un préfixe au schema
+-- Ex : vous configurez +schema: finance → dbt crée "dbt_dev_finance" au lieu de "finance"
+-- Cette surcharge permet d'avoir "finance" directement en prod
+
+{% macro generate_schema_name(custom_schema_name, node) %}
+    {%- set default_schema = target.schema -%}
+    {%- if custom_schema_name is none -%}
+        {{ default_schema }}
+    {%- elif target.name == 'prod' -%}
+        {{ custom_schema_name | trim }}            -- en prod : "finance"
+    {%- else -%}
+        {{ default_schema }}_{{ custom_schema_name | trim }}  -- en dev : "dbt_jean_finance"
+    {%- endif -%}
+{% endmacro %}
+```
+
+3. **Macros d'administration** : exécutées directement via `dbt run-operation`, pas depuis un modèle. Utilisées pour des tâches de maintenance (nettoyage, permissions, etc.).
+
+```sql
+-- macros/drop_ci_schemas.sql
+-- Appelée par : dbt run-operation drop_ci_schemas
+
+{% macro drop_ci_schemas() %}
+    {% set query %}
+        select schema_name from information_schema.schemata
+        where schema_name like 'dbt_ci_%'
+    {% endset %}
+    {% if execute %}
+        {% for row in run_query(query) %}
+            {% do run_query("drop schema if exists " ~ row['schema_name'] ~ " cascade") %}
+        {% endfor %}
+    {% endif %}
+{% endmacro %}
+```
+
+**Macros intégrées à dbt** (disponibles sans rien installer) :
+- `{{ ref('model_name') }}` — référence un modèle
+- `{{ source('source', 'table') }}` — référence une source
+- `{{ var('name', default) }}` — accède à une variable
+- `{{ env_var('ENV_VAR') }}` — lit une variable d'environnement
+- `{{ is_incremental() }}` — true si le modèle tourne en mode incrémental
+- `{{ this }}` — référence la table actuelle du modèle (pour les incrémentaux)
+- `{{ log('message', info=true) }}` — écrit dans les logs
+- `{{ run_query('sql') }}` — exécute du SQL pendant la compilation
+
+**Macros de packages** (installées via `packages.yml`) :
+- `{{ dbt_utils.generate_surrogate_key(['col1', 'col2']) }}` — clé de substitution
+- `{{ dbt_utils.pivot('column', values, ...) }}` — pivoter des lignes en colonnes
+- `{{ dbt_utils.date_spine(datepart, start_date, end_date) }}` — générer une série de dates
+
+---
+
+#### `tests/` — Tests singuliers (SQL custom)
+
+```
+tests/
+  assert_positive_revenue.sql
+  assert_no_orphan_orders.sql
+  assert_twelve_months_coverage.sql
+```
+
+**Rôle** : le dossier `tests/` contient des **tests singuliers** — des requêtes SQL custom que vous écrivez pour vérifier des assertions spécifiques sur vos données. Ils complètent les tests génériques (déclarés dans les fichiers YAML) pour couvrir des cas métier plus complexes.
+
+**Mécanisme interne** : un test singulier est un fichier `.sql` qui contient un `SELECT`. dbt exécute cette requête et **compte les lignes retournées**. Si la requête retourne **0 ligne**, le test passe. Si elle retourne **1 ou plusieurs lignes**, le test échoue — chaque ligne retournée représente un cas en erreur.
+
+Pensez-y comme une requête qui cherche les problèmes : si elle ne trouve rien, tout va bien.
+
+```sql
+-- tests/assert_positive_revenue.sql
+-- Ce test cherche les clients avec un revenu négatif
+-- S'il en trouve → le test ÉCHOUE
+-- S'il n'en trouve pas → le test PASSE
+
+select
+    customer_id,                    -- identifiant du client fautif
+    lifetime_revenue                -- montant négatif trouvé
+from {{ ref('fct_revenue') }}
+where lifetime_revenue < 0          -- condition de recherche des erreurs
+-- Si cette requête retourne 0 ligne → ✅ PASS
+-- Si cette requête retourne 3 lignes → ❌ FAIL (3 clients avec revenu négatif)
+```
+
+```sql
+-- tests/assert_no_orphan_orders.sql
+-- Ce test vérifie l'intégrité référentielle :
+-- chaque commande doit être associée à un client existant
+
+select
+    o.order_id,
+    o.customer_id
+from {{ ref('stg_orders') }} o
+left join {{ ref('stg_customers') }} c
+    on o.customer_id = c.customer_id
+where c.customer_id is null          -- commandes dont le client n'existe pas
+-- 0 ligne → tous les clients existent → ✅
+-- N lignes → N commandes orphelines → ❌
+```
+
+**Différence avec les tests génériques** (YAML) :
+
+| Aspect | Tests génériques (YAML) | Tests singuliers (SQL) |
+|--------|------------------------|----------------------|
+| Emplacement | `_schema.yml` dans `models/` | `tests/*.sql` |
+| Syntaxe | Déclarative (YAML) | Impérative (SQL) |
+| Réutilisabilité | Un test = plusieurs colonnes | Un test = un cas spécifique |
+| Complexité | Simple (not_null, unique) | Illimitée (jointures, agrégations) |
+| Exemple | `- unique` | Vérifier que les 12 mois sont couverts |
+
+**Quand utiliser un test singulier** :
+- Vérification métier complexe (ex : le total des lignes de commande = le total de la commande)
+- Assertions cross-tables (ex : pas de commandes orphelines)
+- Vérifications d'agrégats (ex : le revenu total est cohérent avec le mois précédent)
+- Tests qui nécessitent du SQL complexe (fenêtres, sous-requêtes)
+
+---
 
 #### `seeds/` — Données de référence
 
-Fichiers CSV versionnés dans Git, chargés dans le warehouse via `dbt seed`. Idéal pour les données de mapping, les codes pays, les catégories.
+```
+seeds/
+  country_codes.csv
+  payment_types.csv
+  currency_rates.csv
+```
 
-#### `snapshots/` — Historisation
+**Rôle** : les seeds sont des **fichiers CSV versionnés dans Git** qui sont chargés dans le data warehouse comme des tables. Ils servent à stocker des données de référence qui changent rarement et que vous voulez contrôler par le code plutôt que par un système d'ingestion.
 
-Capture les changements dans les données sources au fil du temps (Slowly Changing Dimensions Type 2).
+**Mécanisme interne** : quand vous lancez `dbt seed`, dbt lit chaque fichier CSV du dossier `seeds/`, crée une table dans le warehouse (ou la remplace si elle existe), et y insère les données du CSV ligne par ligne. La table résultante est ensuite utilisable via `{{ ref('nom_du_seed') }}` exactement comme un modèle.
+
+```csv
+# seeds/payment_types.csv
+code,label,is_electronic
+1,Credit card,true
+2,Cash,false
+3,Bank transfer,true
+4,Voucher,false
+5,No charge,false
+```
+
+```sql
+-- Utilisation dans un modèle staging :
+-- Le seed est référencé via ref() comme n'importe quel modèle
+
+select
+    o.order_id,
+    o.payment_type_code,
+    pt.label as payment_method,           -- enrichissement depuis le seed
+    pt.is_electronic
+from {{ ref('stg_orders') }} o
+left join {{ ref('payment_types') }} pt   -- jointure avec le seed
+    on o.payment_type_code = pt.code
+```
+
+**Cas d'usage** :
+- Tables de mapping (codes pays, codes devises, codes de paiement)
+- Tables de correspondance (ancien ID → nouvel ID après une migration)
+- Tables de paramétrage (taux de TVA par pays, seuils d'alerte)
+- Données de test (jeux de données fixes pour les tests unitaires)
+- Listes de référence (catégories, statuts, types)
+
+**Ce qu'il ne faut PAS mettre dans les seeds** :
+- Données volumineuses (> quelques milliers de lignes) → utilisez l'ingestion classique
+- Données qui changent souvent → utilisez une source
+- Données sensibles (mots de passe, tokens) → utilisez des variables d'environnement
+- Résultats de requêtes → c'est le rôle des modèles
+
+**Configuration dans dbt_project.yml** :
+
+```yaml
+seeds:
+  mon_projet:
+    +schema: reference                      # schema dédié aux seeds
+    country_codes:                          # configuration par seed
+      +column_types:                        # forcer les types de colonnes
+        code: varchar(3)
+        population: bigint
+```
+
+---
+
+#### `snapshots/` — Historisation (SCD Type 2)
+
+```
+snapshots/
+  snapshot_customers.sql
+  snapshot_products.sql
+  snapshot_pricing.sql
+```
+
+**Rôle** : les snapshots capturent **l'historique des changements** d'une table source au fil du temps. Si un client change de segment (de "Silver" à "Gold"), un modèle classique ne verrait que l'état actuel ("Gold"). Un snapshot conserve les deux états avec des dates de validité.
+
+**Mécanisme interne** : quand vous lancez `dbt snapshot`, voici ce que dbt fait pour chaque snapshot :
+
+1. Il lit la table source
+2. Il compare chaque ligne avec ce qu'il a déjà stocké (identifié par la `unique_key`)
+3. **Nouvelle ligne** (pas dans le snapshot) → elle est insérée avec `dbt_valid_from = now()` et `dbt_valid_to = null`
+4. **Ligne modifiée** (elle existe mais des colonnes ont changé) → l'ancienne version reçoit `dbt_valid_to = now()`, la nouvelle version est insérée avec `dbt_valid_from = now()` et `dbt_valid_to = null`
+5. **Ligne inchangée** → rien ne se passe
+6. **Ligne supprimée** (optionnel) → l'ancienne version reçoit `dbt_valid_to = now()`
+
+Le résultat est une table qui contient **toutes les versions** de chaque ligne, avec des plages temporelles de validité.
+
+```sql
+-- snapshots/snapshot_customers.sql
+
+{% snapshot snapshot_customers %}
+
+{{
+  config(
+    target_schema='snapshots',         -- schema dédié aux snapshots
+    unique_key='customer_id',          -- clé pour identifier chaque entité
+    strategy='timestamp',              -- stratégie : comparer via un timestamp
+    updated_at='updated_at',           -- colonne de dernière modification
+    invalidate_hard_deletes=true       -- marquer les lignes supprimées de la source
+  )
+}}
+
+select
+    customer_id,
+    customer_name,
+    customer_email,
+    customer_segment,                   -- ce champ peut changer avec le temps
+    subscription_plan,                  -- ce champ aussi
+    updated_at
+from {{ source('ecommerce', 'customers') }}
+
+{% endsnapshot %}
+```
+
+**Résultat dans le warehouse** (exemple) :
+
+| customer_id | customer_name | customer_segment | dbt_valid_from | dbt_valid_to | dbt_scd_id |
+|-------------|--------------|-----------------|----------------|--------------|------------|
+| 42 | Alice Martin | Silver | 2024-01-15 | 2024-06-01 | abc123 |
+| 42 | Alice Martin | Gold | 2024-06-01 | null | def456 |
+| 42 | Alice Martin | Gold | 2024-06-01 | null | def456 |
+
+La ligne avec `dbt_valid_to = null` est la **version actuelle**. Les autres sont l'historique.
+
+**Deux stratégies de détection des changements** :
+
+| Stratégie | Quand l'utiliser | Comment ça marche |
+|-----------|-----------------|-------------------|
+| `timestamp` | Quand la source a une colonne `updated_at` fiable | Compare le timestamp — si plus récent, c'est un changement |
+| `check` | Quand il n'y a pas de timestamp fiable | Compare les valeurs de colonnes spécifiées — si différentes, c'est un changement |
+
+```sql
+-- Stratégie 'check' — quand il n'y a pas de colonne updated_at
+{% snapshot snapshot_pricing %}
+{{
+  config(
+    target_schema='snapshots',
+    unique_key='product_id',
+    strategy='check',                       -- compare les colonnes listées ci-dessous
+    check_cols=['price', 'discount_pct']    -- si l'un de ces champs change → nouvelle version
+  )
+}}
+select product_id, price, discount_pct, product_name
+from {{ source('catalog', 'products') }}
+{% endsnapshot %}
+```
+
+**Cas d'usage concrets** :
+- Historique des prix produits (pour analyser l'impact des changements de prix)
+- Historique des segments clients (pour mesurer les montées/descentes en gamme)
+- Historique des statuts (pour calculer des durées dans chaque statut)
+- Conformité réglementaire (certains secteurs exigent de conserver l'historique)
+
+---
 
 #### `analyses/` — Requêtes non matérialisées
 
-Requêtes SQL qui bénéficient du moteur Jinja de dbt mais qui ne sont pas matérialisées dans le warehouse. Utiles pour des analyses ponctuelles.
+```
+analyses/
+  monthly_revenue_check.sql
+  customer_cohort_exploration.sql
+  data_quality_audit.sql
+```
+
+**Rôle** : le dossier `analyses/` contient des requêtes SQL qui **bénéficient du moteur Jinja de dbt** (vous pouvez utiliser `{{ ref() }}`, `{{ source() }}`, des macros, des variables) mais qui ne sont **jamais exécutées** automatiquement et ne créent **aucun objet** dans le warehouse.
+
+**Mécanisme interne** : quand vous lancez `dbt compile`, dbt compile les analyses (résolution du Jinja → SQL pur) et place le résultat dans `target/compiled/mon_projet/analyses/`. Vous pouvez ensuite copier ce SQL compilé et l'exécuter manuellement dans votre outil SQL préféré.
+
+`dbt run` et `dbt build` **ignorent complètement** les analyses. Elles ne sont jamais exécutées automatiquement.
+
+```sql
+-- analyses/monthly_revenue_check.sql
+-- Requête d'audit mensuel — compilée par dbt mais exécutée manuellement
+
+select
+    date_trunc('month', order_date) as month,
+    count(distinct customer_id) as unique_customers,
+    count(*) as total_orders,
+    sum(amount_euros) as total_revenue,
+    sum(amount_euros) / count(*) as avg_order_value
+from {{ ref('fct_revenue') }}                         -- bénéficie de ref()
+where order_date >= '{{ var("start_date") }}'         -- bénéficie de var()
+group by date_trunc('month', order_date)
+order by month desc
+```
+
+**Cas d'usage** :
+- Requêtes d'exploration ad hoc qu'on veut versionner dans Git
+- Audits de données ponctuels
+- Prototypage de futurs modèles (tester une logique avant d'en faire un modèle)
+- Requêtes de support/debug que l'équipe partage
+
+**Différence avec un modèle** :
+- Un modèle crée un objet dans le warehouse (vue, table)
+- Une analyse ne crée rien — elle est juste compilée
+
+---
 
 #### `dbt_project.yml` — Configuration du projet
 
-Fichier racine qui définit le projet : nom, version, chemins des dossiers, configuration des matérialisations par défaut.
+**Rôle** : c'est le fichier qui **définit un dossier comme un projet dbt**. Sans ce fichier, dbt ne reconnaît pas le dossier comme un projet. Il contient la configuration globale : nom du projet, chemins des dossiers, matérialisations par défaut, variables, et bien plus.
+
+**Mécanisme de précédence** : dbt applique les configurations du plus global au plus spécifique. Si vous définissez une matérialisation dans `dbt_project.yml` ET dans un bloc `{{ config() }}` dans le modèle, le bloc `config()` **prend le dessus**.
+
+```
+Ordre de précédence (du plus faible au plus fort) :
+1. dbt_project.yml    ← configuration globale (la plus faible)
+2. schema.yml         ← configuration par modèle dans le YAML
+3. {{ config() }}     ← configuration dans le fichier SQL du modèle (la plus forte)
+```
+
+```yaml
+# dbt_project.yml — Exemple complet commenté
+
+# ═══════════════════════════════════════════════════════
+# IDENTIFICATION DU PROJET
+# ═══════════════════════════════════════════════════════
+name: 'mon_projet_dbt'            # nom unique du projet (snake_case, obligatoire)
+                                   # utilisé comme namespace pour les macros et configs
+config-version: 2                  # version du format de config (toujours 2)
+version: '1.0.0'                   # version sémantique de votre projet
+
+# Profil de connexion (doit correspondre à une entrée dans profiles.yml)
+profile: 'mon_projet_dbt'
+
+# ═══════════════════════════════════════════════════════
+# CHEMINS DES DOSSIERS
+# ═══════════════════════════════════════════════════════
+# Les valeurs ci-dessous sont les défauts — déclarez-les seulement si vous changez
+model-paths: ["models"]            # où trouver les modèles SQL
+analysis-paths: ["analyses"]       # où trouver les analyses
+test-paths: ["tests"]              # où trouver les tests singuliers
+seed-paths: ["seeds"]              # où trouver les fichiers CSV
+macro-paths: ["macros"]            # où trouver les macros Jinja
+snapshot-paths: ["snapshots"]      # où trouver les snapshots
+# Note : les chemins sont des listes — vous pouvez avoir plusieurs dossiers :
+# model-paths: ["models", "models_legacy"]
+
+# Dossiers à supprimer lors d'un `dbt clean`
+clean-targets:
+  - "target"                       # dossier de compilation
+  - "dbt_packages"                 # packages installés
+
+# ═══════════════════════════════════════════════════════
+# CONFIGURATION DES MODÈLES (matérialisations par défaut)
+# ═══════════════════════════════════════════════════════
+models:
+  mon_projet_dbt:                  # doit correspondre au 'name' ci-dessus
+
+    staging:                       # s'applique à models/staging/**
+      +materialized: view          # tous les modèles staging en view
+      +tags: ['staging']           # tag pour la sélection groupée
+
+    intermediate:                  # s'applique à models/intermediate/**
+      +materialized: view          # intermediate en view
+
+    marts:                         # s'applique à models/marts/**
+      +materialized: table         # marts en table pour la BI
+      +tags: ['marts']
+
+      finance:                     # s'applique à models/marts/finance/**
+        +schema: finance           # schema dédié en prod
+
+      marketing:                   # s'applique à models/marts/marketing/**
+        +schema: marketing
+
+# ═══════════════════════════════════════════════════════
+# CONFIGURATION DES SEEDS
+# ═══════════════════════════════════════════════════════
+seeds:
+  mon_projet_dbt:
+    +schema: reference             # schema dédié pour les seeds
+
+# ═══════════════════════════════════════════════════════
+# CONFIGURATION DES TESTS
+# ═══════════════════════════════════════════════════════
+tests:
+  mon_projet_dbt:
+    +severity: error               # les tests échouent en erreur par défaut
+    +store_failures: true          # stocker les lignes en échec dans le warehouse
+
+# ═══════════════════════════════════════════════════════
+# VARIABLES GLOBALES
+# ═══════════════════════════════════════════════════════
+vars:
+  start_date: '2024-01-01'
+  is_ci: false
+
+# ═══════════════════════════════════════════════════════
+# HOOKS (SQL exécuté avant/après un run)
+# ═══════════════════════════════════════════════════════
+on-run-end:
+  - "{{ log('Run terminé avec succès', info=true) }}"
+
+# ═══════════════════════════════════════════════════════
+# CONTRAINTE DE VERSION dbt
+# ═══════════════════════════════════════════════════════
+require-dbt-version: [">=1.7.0", "<2.0.0"]   # version min et max supportées
+
+# ═══════════════════════════════════════════════════════
+# CONFIGURATION dbt CLOUD (seulement si vous utilisez dbt Cloud)
+# ═══════════════════════════════════════════════════════
+# dbt-cloud:
+#   project-id: 12345
+#   defer-env-id: 67890
+```
+
+---
 
 #### `profiles.yml` — Connexion au warehouse
 
-Contient les informations de connexion au data warehouse. Ce fichier est généralement **en dehors du repo Git** (dans `~/.dbt/profiles.yml`) pour des raisons de sécurité.
+**Rôle** : contient toutes les informations de connexion à votre data warehouse. C'est le fichier qui fait le lien entre dbt et la base de données où les transformations seront exécutées.
+
+**Emplacement** : par défaut, dbt cherche ce fichier dans `~/.dbt/profiles.yml` (votre répertoire home). C'est voulu pour **ne pas le committer dans Git** — il contient des informations sensibles (mots de passe, chemins de keyfiles). Vous pouvez changer l'emplacement avec la variable d'environnement `DBT_PROFILES_DIR`.
+
+**Mécanisme interne** : le champ `profile` dans `dbt_project.yml` doit correspondre à une clé de premier niveau dans `profiles.yml`. dbt utilise le `target` par défaut (champ `target:`) sauf si vous le surchargez avec `--target`.
+
+```yaml
+# ~/.dbt/profiles.yml (emplacement par défaut — hors du repo Git)
+
+mon_projet_dbt:                  # ← doit correspondre à 'profile' dans dbt_project.yml
+  target: dev                     # target utilisé par défaut quand on lance 'dbt run'
+
+  outputs:                        # liste des targets disponibles
+    dev:                          # ── DÉVELOPPEMENT ──
+      type: bigquery              # chaque target peut cibler un warehouse différent
+      method: oauth
+      project: mon-projet-gcp-dev
+      dataset: "dbt_{{ env_var('USER', 'default') }}"  # schema unique par développeur
+      threads: 4                  # nombre de modèles exécutés en parallèle
+      location: EU
+
+    staging:                      # ── STAGING / PREPROD ──
+      type: bigquery
+      method: service-account
+      project: mon-projet-gcp-staging
+      dataset: dbt_staging
+      threads: 8
+      keyfile: "{{ env_var('DBT_GOOGLE_KEYFILE') }}"   # keyfile via variable d'env
+      location: EU
+
+    prod:                         # ── PRODUCTION ──
+      type: bigquery
+      method: service-account
+      project: mon-projet-gcp-prod
+      dataset: dbt_prod
+      threads: 16
+      keyfile: "{{ env_var('DBT_GOOGLE_KEYFILE_PROD') }}"
+      location: EU
+
+    ci:                           # ── CI/CD ──
+      type: bigquery
+      method: service-account
+      project: mon-projet-gcp-dev
+      dataset: "dbt_ci_{{ env_var('GITHUB_RUN_ID', 'local') }}"  # schema unique par run CI
+      threads: 4
+      keyfile: "{{ env_var('DBT_GOOGLE_KEYFILE') }}"
+      location: EU
+```
+
+```bash
+# Utiliser un target spécifique (surcharge le target par défaut)
+dbt run --target prod              # exécute sur production
+dbt run --target staging           # exécute sur staging
+dbt run                            # utilise le target par défaut (dev)
+```
+
+**Bonnes pratiques sécurité** :
+- Ne **jamais** committer `profiles.yml` dans Git (ajoutez-le dans `.gitignore`)
+- Utiliser `{{ env_var('VAR_NAME') }}` pour les mots de passe et chemins de keyfiles
+- En CI/CD, passer les secrets via les GitHub Secrets ou votre gestionnaire de secrets
+- Chaque développeur a son propre schema dev (ex : `dbt_jean`, `dbt_marie`)
+
+---
 
 #### `packages.yml` — Dépendances
 
-Déclare les packages dbt externes à installer (comme `dbt_utils`, `dbt_expectations`).
+```
+packages.yml             # à la racine du projet, versionné dans Git
+```
+
+**Rôle** : déclare les **packages dbt externes** à installer. Un package dbt est un projet dbt réutilisable contenant des macros, des tests et parfois des modèles. C'est l'équivalent de `package.json` (Node.js) ou `requirements.txt` (Python) pour dbt.
+
+**Mécanisme interne** : quand vous lancez `dbt deps`, dbt lit `packages.yml`, télécharge chaque package (depuis le hub dbt, un dépôt Git, ou un chemin local), et les installe dans le dossier `dbt_packages/`. Les macros et tests de ces packages deviennent alors disponibles dans votre projet.
+
+```yaml
+# packages.yml — Exemple complet
+
+packages:
+  # ─── Packages depuis le Hub dbt (hub.getdbt.com) ───
+  - package: dbt-labs/dbt_utils                   # boîte à outils incontournable
+    version: [">=1.0.0", "<2.0.0"]                # contrainte de version sémantique
+    # Contient : surrogate_key, pivot, unpivot, date_spine, union_relations...
+
+  - package: calogica/dbt_expectations             # tests avancés (style Great Expectations)
+    version: [">=0.10.0", "<0.11.0"]
+    # Contient : expect_column_to_exist, expect_values_to_be_between,
+    #            expect_column_values_to_be_of_type...
+
+  - package: dbt-labs/codegen                      # génération de code
+    version: [">=0.12.0", "<0.13.0"]
+    # Contient : generate_source (crée le YAML de sources automatiquement),
+    #            generate_model_yaml (crée le schema.yml d'un modèle)
+
+  - package: dbt-labs/audit_helper                 # audit et comparaison
+    version: [">=0.9.0", "<0.10.0"]
+    # Contient : compare_relations (compare deux tables colonne par colonne)
+
+  # ─── Package depuis un dépôt Git privé ───
+  - git: "https://github.com/mon-org/dbt-internal-utils.git"
+    revision: v2.1.0                               # tag Git, branche, ou SHA de commit
+
+  # ─── Package depuis un chemin local (dev) ───
+  # - local: ../mon-autre-package
+```
+
+```bash
+# Installer les packages (à lancer après chaque modification de packages.yml)
+dbt deps
+
+# Les packages sont installés dans dbt_packages/ (ajoutez-le au .gitignore)
+```
+
+**Résultat dans l'arborescence** :
+
+```
+dbt_packages/                        # créé par dbt deps (ne pas committer)
+  dbt_utils/                         # le package installé
+    macros/                          # les macros deviennent disponibles
+      generate_surrogate_key.sql
+      pivot.sql
+      ...
+    dbt_project.yml                  # chaque package est un projet dbt complet
+  dbt_expectations/
+    ...
+```
+
+**Usage des macros de packages dans vos modèles** :
+
+```sql
+-- Pas besoin d'import — les macros sont automatiquement disponibles après dbt deps
+select
+    {{ dbt_utils.generate_surrogate_key(['order_id', 'product_id']) }} as line_id,
+    order_id,
+    product_id,
+    quantity
+from {{ ref('stg_order_lines') }}
+```
 
 ---
+
+#### Fichiers complémentaires
+
+##### `selectors.yml` — Groupes de sélection nommés (optionnel)
+
+**Rôle** : permet de créer des **sélections nommées et réutilisables** de modèles. Au lieu de taper une commande de sélection complexe à chaque fois, vous la nommez une fois et l'utilisez avec `--selector`.
+
+```yaml
+# selectors.yml
+selectors:
+  - name: nightly_build
+    description: "Tous les modèles à exécuter chaque nuit"
+    definition:
+      union:
+        - "tag:nightly"
+        - "path:models/marts"
+        - exclude:
+            - "tag:experimental"
+```
+
+```bash
+# Au lieu de taper la sélection complète
+dbt build --selector nightly_build
+```
+
+##### `.gitignore` — Fichiers à exclure de Git
+
+```gitignore
+# .gitignore pour un projet dbt
+
+# Artefacts de compilation — régénérés à chaque run
+target/
+logs/
+
+# Packages installés — régénérés par dbt deps
+dbt_packages/
+
+# Connexion au warehouse — contient des secrets
+profiles.yml
+
+# Fichiers système
+.DS_Store
+__pycache__/
+*.pyc
+
+# Environnements virtuels Python
+.venv/
+venv/
+```
+
 
 ## 3. Installation et démarrage
 
@@ -1145,103 +2062,579 @@ models:
 
 ## 8. Jinja et Macros
 
-### 8.1 Syntaxe Jinja dans dbt
+### 8.1 Qu'est-ce que Jinja dans dbt ?
 
-Jinja est le moteur de templating intégré à dbt. Il enrichit le SQL avec de la logique dynamique.
+Jinja est un moteur de templating Python intégré nativement dans dbt. Il transforme vos fichiers SQL en **templates dynamiques** capables de générer du SQL différent selon le contexte (environnement, variables, conditions). Quand vous exécutez `dbt run` ou `dbt compile`, dbt commence par résoudre tout le Jinja, puis envoie le SQL pur résultant au warehouse.
+
+Le cycle est donc : **Jinja + SQL → compilation → SQL pur → exécution sur le warehouse**.
+
+Vous pouvez voir le SQL compilé (sans Jinja) dans le dossier `target/compiled/` après un `dbt compile`.
+
+### 8.2 Les 3 types de blocs Jinja
 
 ```sql
--- Les 3 types de blocs Jinja :
+-- ═══════════════════════════════════════════════════════════════
+-- TYPE 1 : EXPRESSIONS  {{ ... }}
+-- Rôle : évaluer et afficher une valeur dans le SQL généré
+-- ═══════════════════════════════════════════════════════════════
 
--- 1. Expressions : {{ ... }} → affichent une valeur
+-- Appeler une fonction dbt (ref, source, var, etc.)
 select * from {{ ref('stg_orders') }}
+-- Compilé en → select * from analytics.dbt_dev.stg_orders
 
--- 2. Instructions : {% ... %} → logique (if, for, set)
-{% if target.name == 'dev' %}
-    limit 100                            -- limite en dev pour accélérer le dev
-{% endif %}
+-- Afficher une variable
+where order_date >= '{{ var("start_date") }}'
+-- Compilé en → where order_date >= '2024-01-01'
 
--- 3. Commentaires : {# ... #} → ignorés à la compilation
-{# Ce commentaire n'apparaît pas dans le SQL compilé #}
+-- Appeler une macro personnalisée
+select {{ cents_to_euros('amount_cents') }} as amount_euros
+-- Compilé en → select round(amount_cents / 100.0, 2) as amount_euros
+
+-- Afficher le nom du target courant
+-- {{ target.name }}  → 'dev', 'staging', ou 'prod'
+
+-- Afficher le schema courant
+-- {{ target.schema }} → 'dbt_dev', 'dbt_prod', etc.
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- TYPE 2 : INSTRUCTIONS  {% ... %}
+-- Rôle : logique de contrôle (conditions, boucles, variables)
+-- Ces blocs ne produisent aucun texte dans le SQL final
+-- ═══════════════════════════════════════════════════════════════
+
+{% set my_variable = 42 %}               -- déclarer une variable
+{% if condition %}...{% endif %}          -- condition
+{% for item in list %}...{% endfor %}    -- boucle
+
+-- IMPORTANT : les instructions ne génèrent PAS de texte
+-- Seul le contenu entre les blocs est inclus dans le SQL
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- TYPE 3 : COMMENTAIRES  {# ... #}
+-- Rôle : commentaires Jinja, invisibles dans le SQL compilé
+-- Différent des commentaires SQL (-- ...) qui eux restent
+-- ═══════════════════════════════════════════════════════════════
+
+{# Ce commentaire n'apparaît PAS dans le SQL compilé #}
+-- Ce commentaire SQL apparaît dans le SQL compilé
+
+{# 
+   Les commentaires Jinja peuvent
+   s'étendre sur plusieurs lignes
+#}
 ```
 
-### 8.2 Conditions et boucles
+### 8.3 Variables Jinja — `set`
+
+Les variables Jinja permettent de stocker des valeurs pour les réutiliser dans le modèle.
 
 ```sql
--- Exemple de condition : adapter le comportement selon l'environnement
-select *
-from {{ ref('stg_orders') }}
-{% if target.name == 'dev' %}
-    where order_date >= dateadd('month', -3, current_date)  -- 3 mois en dev
-{% elif target.name == 'staging' %}
-    where order_date >= dateadd('year', -1, current_date)   -- 1 an en staging
-{% endif %}
--- En prod, pas de filtre → toutes les données
-```
+-- ═══════════════════════════════════════════════════════════════
+-- VARIABLES SIMPLES
+-- ═══════════════════════════════════════════════════════════════
 
-```sql
--- Exemple de boucle : générer dynamiquement du SQL
-{% set payment_methods = ['credit_card', 'cash', 'bank_transfer'] %}
+-- Déclarer une variable simple
+{% set tva_rate = 0.20 %}
 
 select
     order_id,
-    {% for method in payment_methods %}
-        sum(case when payment_method = '{{ method }}' then amount else 0 end)
-            as {{ method }}_amount                    -- colonne par méthode
-        {% if not loop.last %},{% endif %}            -- virgule sauf après le dernier
+    amount_ht,                                              -- montant hors taxe
+    amount_ht * {{ tva_rate }} as tva_amount,               -- montant TVA (20%)
+    amount_ht * (1 + {{ tva_rate }}) as amount_ttc          -- montant TTC
+from {{ ref('stg_orders') }}
+-- Compilé en →
+-- amount_ht * 0.2 as tva_amount,
+-- amount_ht * (1 + 0.2) as amount_ttc
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- VARIABLES LISTES
+-- ═══════════════════════════════════════════════════════════════
+
+-- Déclarer une liste
+{% set status_list = ['pending', 'shipped', 'completed'] %}
+
+select *
+from {{ ref('stg_orders') }}
+where order_status in (
+    {% for status in status_list %}
+        '{{ status }}'{% if not loop.last %},{% endif %}    -- virgule entre chaque, sauf le dernier
     {% endfor %}
-from {{ ref('stg_payments') }}
-group by order_id
+)
+-- Compilé en →
+-- where order_status in ('pending', 'shipped', 'completed')
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- VARIABLES DICTIONNAIRES
+-- ═══════════════════════════════════════════════════════════════
+
+-- Déclarer un dictionnaire
+{% set column_mapping = {
+    'usr_id': 'customer_id',
+    'ord_dt': 'order_date',
+    'amt': 'amount_euros'
+} %}
+
+select
+    {% for old_name, new_name in column_mapping.items() %}
+        {{ old_name }} as {{ new_name }}{% if not loop.last %},{% endif %}
+    {% endfor %}
+from {{ source('legacy', 'orders') }}
+-- Compilé en →
+-- usr_id as customer_id,
+-- ord_dt as order_date,
+-- amt as amount_euros
 ```
 
-### 8.3 Créer une macro
+### 8.4 Conditions — `if / elif / else`
 
 ```sql
--- macros/cents_to_euros.sql
--- Macro utilitaire pour convertir les centimes en euros
+-- ═══════════════════════════════════════════════════════════════
+-- CONDITION SIMPLE : adapter selon l'environnement
+-- ═══════════════════════════════════════════════════════════════
+
+select *
+from {{ ref('stg_orders') }}
+
+{% if target.name == 'dev' %}
+    -- En dev : limiter aux 3 derniers mois pour accélérer le développement
+    where order_date >= dateadd('month', -3, current_date)
+
+{% elif target.name == 'staging' %}
+    -- En staging : limiter à 1 an pour tester sur un volume réaliste
+    where order_date >= dateadd('year', -1, current_date)
+
+{% endif %}
+-- En prod (pas de condition matchée) : aucun filtre → toutes les données
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- CONDITION AVEC VARIABLE : activer/désactiver des fonctionnalités
+-- ═══════════════════════════════════════════════════════════════
+
+-- La variable 'include_cancelled' peut être passée via --vars
+{% set include_cancelled = var('include_cancelled', false) %}
+
+select *
+from {{ ref('stg_orders') }}
+
+{% if not include_cancelled %}
+    where order_status != 'cancelled'    -- exclure les annulées par défaut
+{% endif %}
+
+-- Appel avec : dbt run --vars '{"include_cancelled": true}'
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- CONDITION SUR LE TYPE DE WAREHOUSE (adapter le SQL)
+-- ═══════════════════════════════════════════════════════════════
+
+select
+    order_id,
+
+    -- La fonction de calcul de différence de dates varie selon le warehouse
+    {% if target.type == 'bigquery' %}
+        date_diff(dropoff_datetime, pickup_datetime, minute)
+    {% elif target.type == 'snowflake' %}
+        datediff('minute', pickup_datetime, dropoff_datetime)
+    {% elif target.type == 'postgres' %}
+        extract(epoch from (dropoff_datetime - pickup_datetime)) / 60
+    {% elif target.type == 'duckdb' %}
+        date_diff('minute', pickup_datetime, dropoff_datetime)
+    {% else %}
+        -- Fallback générique
+        datediff('minute', pickup_datetime, dropoff_datetime)
+    {% endif %}
+    as trip_duration_minutes
+
+from {{ ref('stg_trips') }}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- is_incremental() : condition spéciale pour les modèles incrémentaux
+-- ═══════════════════════════════════════════════════════════════
+
+{{
+  config(
+    materialized='incremental',
+    unique_key='event_id'
+  )
+}}
+
+select *
+from {{ source('analytics', 'events') }}
+
+{% if is_incremental() %}
+    -- Cette condition est vraie UNIQUEMENT si :
+    -- 1. Le modèle existe déjà dans le warehouse
+    -- 2. On n'est PAS en mode --full-refresh
+    -- Elle filtre pour ne traiter que les nouvelles données
+    where event_timestamp > (
+        select max(event_timestamp) from {{ this }}   -- {{ this }} = la table actuelle
+    )
+{% endif %}
+-- Premier run : is_incremental() = false → charge TOUT
+-- Runs suivants : is_incremental() = true → charge seulement le nouveau
+```
+
+### 8.5 Boucles — `for`
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- BOUCLE SIMPLE : générer des colonnes dynamiquement
+-- ═══════════════════════════════════════════════════════════════
+
+{% set payment_methods = ['credit_card', 'cash', 'bank_transfer', 'voucher'] %}
+
+select
+    order_id,
+
+    -- Génère une colonne par méthode de paiement
+    {% for method in payment_methods %}
+        sum(
+            case
+                when payment_method = '{{ method }}'
+                then amount
+                else 0
+            end
+        ) as {{ method }}_amount                           -- ex: credit_card_amount
+
+        {% if not loop.last %},{% endif %}                 -- virgule sauf après le dernier
+    {% endfor %}
+
+from {{ ref('stg_payments') }}
+group by order_id
+
+-- Compilé en →
+-- sum(case when payment_method = 'credit_card' then amount else 0 end) as credit_card_amount,
+-- sum(case when payment_method = 'cash' then amount else 0 end) as cash_amount,
+-- sum(case when payment_method = 'bank_transfer' then amount else 0 end) as bank_transfer_amount,
+-- sum(case when payment_method = 'voucher' then amount else 0 end) as voucher_amount
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- BOUCLE AVEC INDEX : utiliser loop.index
+-- ═══════════════════════════════════════════════════════════════
+
+{% set months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] %}
+
+select
+    year,
+    {% for month in months %}
+        -- loop.index commence à 1 (loop.index0 commence à 0)
+        sum(case when extract(month from order_date) = {{ loop.index }}
+            then amount else 0 end) as revenue_{{ month | lower }}
+        {% if not loop.last %},{% endif %}
+    {% endfor %}
+from {{ ref('stg_orders') }}
+group by year
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- BOUCLE SUR UN DICTIONNAIRE : renommer des colonnes
+-- ═══════════════════════════════════════════════════════════════
+
+{% set renames = {
+    'cust_id': 'customer_id',
+    'ord_date': 'order_date',
+    'prod_name': 'product_name',
+    'qty': 'quantity',
+    'unit_px': 'unit_price'
+} %}
+
+select
+    {% for old_col, new_col in renames.items() %}
+        {{ old_col }} as {{ new_col }}{% if not loop.last %},{% endif %}
+    {% endfor %}
+from {{ source('legacy_system', 'orders') }}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- BOUCLE AVEC UNION ALL : combiner plusieurs sources similaires
+-- ═══════════════════════════════════════════════════════════════
+
+{% set years = [2022, 2023, 2024] %}
+
+{% for year in years %}
+    select
+        *,
+        {{ year }} as source_year                          -- ajouter l'année d'origine
+    from {{ source('archive', 'orders_' ~ year) }}         -- ~ = concaténation Jinja
+
+    {% if not loop.last %}
+    union all                                              -- union entre chaque année
+    {% endif %}
+{% endfor %}
+-- Compilé en →
+-- select *, 2022 as source_year from archive.orders_2022
+-- union all
+-- select *, 2023 as source_year from archive.orders_2023
+-- union all
+-- select *, 2024 as source_year from archive.orders_2024
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- PROPRIÉTÉS DE loop DISPONIBLES DANS UNE BOUCLE
+-- ═══════════════════════════════════════════════════════════════
+
+{# 
+   loop.index      → itération courante (commence à 1)
+   loop.index0     → itération courante (commence à 0)
+   loop.first      → true si c'est la première itération
+   loop.last       → true si c'est la dernière itération
+   loop.length     → nombre total d'itérations
+   loop.revindex   → itérations restantes (commence à length, finit à 1)
+#}
+```
+
+### 8.6 Filtres Jinja
+
+Les filtres transforment une valeur. Ils s'appliquent avec le pipe `|`.
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- FILTRES LES PLUS UTILES DANS dbt
+-- ═══════════════════════════════════════════════════════════════
+
+{% set my_name = "Hello World" %}
+
+-- Changement de casse
+{{ my_name | lower }}          -- → "hello world"
+{{ my_name | upper }}          -- → "HELLO WORLD"
+{{ my_name | capitalize }}     -- → "Hello world"
+{{ my_name | title }}          -- → "Hello World"
+
+-- Remplacement
+{{ my_name | replace("World", "dbt") }}  -- → "Hello dbt"
+
+-- Suppression des espaces
+{% set padded = "  hello  " %}
+{{ padded | trim }}            -- → "hello"
+
+-- Valeur par défaut si la variable est undefined ou None
+{{ my_undefined_var | default("fallback_value") }}
+
+-- Conversion en string
+{{ 42 | string }}              -- → "42"
+
+-- Conversion en entier
+{{ "42" | int }}               -- → 42
+
+-- Jointure d'une liste en string
+{% set cols = ['a', 'b', 'c'] %}
+{{ cols | join(', ') }}        -- → "a, b, c"
+
+-- Longueur d'une liste ou string
+{{ cols | length }}            -- → 3
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- EXEMPLE PRATIQUE : filtres dans un modèle
+-- ═══════════════════════════════════════════════════════════════
+
+{% set columns_to_select = ['order_id', 'customer_id', 'amount', 'order_date'] %}
+
+select
+    {{ columns_to_select | join(',\n    ') }}              -- joint avec virgule + retour à la ligne
+from {{ ref('stg_orders') }}
+
+-- Compilé en →
+-- select
+--     order_id,
+--     customer_id,
+--     amount,
+--     order_date
+-- from ...
+```
+
+### 8.7 Les espaces blancs — contrôle avec `-`
+
+Jinja génère parfois des lignes vides indésirables dans le SQL compilé. Le tiret `-` permet de supprimer les espaces blancs.
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- PROBLÈME : lignes vides dans le SQL compilé
+-- ═══════════════════════════════════════════════════════════════
+
+-- SANS contrôle des espaces (génère des lignes vides)
+{% set limit_rows = 100 %}
+select *
+from {{ ref('stg_orders') }}
+{% if target.name == 'dev' %}
+limit {{ limit_rows }}
+{% endif %}
+-- Compilé en (notez les lignes vides) →
+-- select *
+-- from analytics.dbt_dev.stg_orders
+--
+-- limit 100
+--
+
+
+-- AVEC contrôle des espaces (propre)
+{%- set limit_rows = 100 -%}                              -- tiret = supprime les espaces autour
+select *
+from {{ ref('stg_orders') }}
+{%- if target.name == 'dev' %}
+limit {{ limit_rows }}
+{%- endif %}
+-- Compilé en (propre) →
+-- select *
+-- from analytics.dbt_dev.stg_orders
+-- limit 100
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- RÈGLE GÉNÉRALE
+-- ═══════════════════════════════════════════════════════════════
+
+{# 
+   {%- ... %}   → supprime les espaces AVANT le bloc
+   {% ... -%}   → supprime les espaces APRÈS le bloc
+   {%- ... -%}  → supprime les espaces AVANT et APRÈS
+   
+   Même logique pour les expressions :
+   {{- ... }}   → supprime avant
+   {{ ... -}}   → supprime après
+   {{- ... -}}  → supprime avant et après
+#}
+```
+
+### 8.8 Créer des macros — Les fondamentaux
+
+Une macro est une **fonction réutilisable** écrite en Jinja. Elle vit dans le dossier `macros/` et peut être appelée depuis n'importe quel modèle, test ou autre macro.
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO SIMPLE : conversion de devises
+-- Fichier : macros/cents_to_euros.sql
+-- ═══════════════════════════════════════════════════════════════
 
 {% macro cents_to_euros(column_name, precision=2) %}
-    -- Divise par 100 et arrondit au nombre de décimales souhaité
+    {# 
+       Convertit une colonne de centimes en euros.
+       
+       Arguments :
+         - column_name (str) : nom de la colonne en centimes
+         - precision (int)   : nombre de décimales (défaut : 2)
+       
+       Retourne : expression SQL arrondie en euros
+       
+       Exemple d'appel :
+         {{ cents_to_euros('price_cents') }}
+         → round(price_cents / 100.0, 2)
+    #}
     round({{ column_name }} / 100.0, {{ precision }})
 {% endmacro %}
 ```
 
 ```sql
 -- Utilisation dans un modèle :
+-- models/staging/stg_orders.sql
+
 select
     order_id,
-    {{ cents_to_euros('amount_cents') }} as amount_euros,     -- appel de la macro
-    {{ cents_to_euros('tax_cents', 4) }} as tax_euros          -- avec précision custom
+    {{ cents_to_euros('amount_cents') }} as amount_euros,          -- → round(amount_cents / 100.0, 2)
+    {{ cents_to_euros('shipping_cents') }} as shipping_euros,      -- → round(shipping_cents / 100.0, 2)
+    {{ cents_to_euros('tax_cents', 4) }} as tax_euros              -- → round(tax_cents / 100.0, 4)
 from {{ source('ecommerce', 'raw_orders') }}
 ```
 
-### 8.4 Macro : générer un schema dynamique
-
 ```sql
--- macros/generate_schema_name.sql
--- Surcharge la macro native pour personnaliser les noms de schemas
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO AVEC LOGIQUE CONDITIONNELLE
+-- Fichier : macros/safe_divide.sql
+-- ═══════════════════════════════════════════════════════════════
 
-{% macro generate_schema_name(custom_schema_name, node) %}
-    {%- set default_schema = target.schema -%}
-
-    {%- if custom_schema_name is none -%}
-        {{ default_schema }}                              -- pas de custom → schema par défaut
-    {%- elif target.name == 'prod' -%}
-        {{ custom_schema_name | trim }}                   -- en prod → utilise le custom tel quel
-    {%- else -%}
-        {{ default_schema }}_{{ custom_schema_name | trim }}  -- en dev → préfixe avec le schema dev
-    {%- endif -%}
+{% macro safe_divide(numerator, denominator, default_value=0) %}
+    {# 
+       Division sécurisée : retourne default_value si le dénominateur est 0 ou NULL.
+       Évite les erreurs "division by zero".
+       
+       Arguments :
+         - numerator (str)     : expression du numérateur
+         - denominator (str)   : expression du dénominateur
+         - default_value       : valeur de remplacement (défaut : 0)
+    #}
+    case
+        when {{ denominator }} is null or {{ denominator }} = 0
+        then {{ default_value }}
+        else {{ numerator }} / nullif({{ denominator }}, 0)
+    end
 {% endmacro %}
 ```
 
-### 8.5 Macro utile : limit en CI
+```sql
+-- Utilisation :
+select
+    customer_id,
+    total_revenue,
+    total_orders,
+    {{ safe_divide('total_revenue', 'total_orders') }} as avg_order_value,
+    -- → case when total_orders is null or total_orders = 0 then 0
+    --        else total_revenue / nullif(total_orders, 0) end
+
+    {{ safe_divide('completed_orders', 'total_orders', 'null') }} as completion_rate
+    -- → ...then null else completed_orders / nullif(total_orders, 0) end
+from {{ ref('fct_revenue') }}
+```
+
+### 8.9 Macros avancées
 
 ```sql
--- macros/limit_for_ci.sql
--- Macro pour limiter les données en environnement CI
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO : générer un schema dynamique
+-- Fichier : macros/generate_schema_name.sql
+-- ═══════════════════════════════════════════════════════════════
 
-{% macro limit_for_ci() %}
+-- Cette macro SURCHARGE la macro native de dbt
+-- Elle contrôle comment les noms de schema sont construits
+-- Comportement :
+--   - En prod : utilise le custom_schema_name tel quel (ex: "finance")
+--   - En dev  : préfixe avec le schema personnel (ex: "dbt_jean_finance")
+
+{% macro generate_schema_name(custom_schema_name, node) %}
+
+    {%- set default_schema = target.schema -%}              -- ex: "dbt_dev" ou "dbt_jean"
+
+    {%- if custom_schema_name is none -%}
+        {# Pas de schema custom configuré → utiliser le schema par défaut #}
+        {{ default_schema }}
+
+    {%- elif target.name == 'prod' -%}
+        {# En production → utiliser le schema custom directement #}
+        {# Résultat : "finance", "marketing", etc. #}
+        {{ custom_schema_name | trim }}
+
+    {%- else -%}
+        {# En dev/staging → préfixer pour isoler chaque développeur #}
+        {# Résultat : "dbt_jean_finance", "dbt_jean_marketing", etc. #}
+        {{ default_schema }}_{{ custom_schema_name | trim }}
+
+    {%- endif -%}
+
+{% endmacro %}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO : limiter les données en CI
+-- Fichier : macros/limit_for_ci.sql
+-- ═══════════════════════════════════════════════════════════════
+
+{% macro limit_for_ci(limit_count=1000) %}
+    {# 
+       Ajoute un LIMIT en mode CI pour réduire les coûts.
+       Activé via : dbt run --vars '{"is_ci": true}'
+       
+       Arguments :
+         - limit_count (int) : nombre de lignes max en CI (défaut : 1000)
+    #}
     {%- if var('is_ci', false) -%}
-        limit 1000                    -- échantillon réduit en CI
+        limit {{ limit_count }}
     {%- endif -%}
 {% endmacro %}
 ```
@@ -1249,11 +2642,493 @@ from {{ source('ecommerce', 'raw_orders') }}
 ```sql
 -- Utilisation dans un modèle :
 select *
-from {{ ref('stg_orders') }}
-{{ limit_for_ci() }}                  -- ajoute 'limit 1000' seulement en CI
+from {{ ref('stg_events') }}
+where event_date >= '2024-01-01'
+{{ limit_for_ci() }}                    -- ajoute "limit 1000" uniquement en CI
+-- En CI  → ...where event_date >= '2024-01-01' limit 1000
+-- En dev → ...where event_date >= '2024-01-01'
 ```
 
----
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO : générer des tests de fraîcheur custom
+-- Fichier : macros/assert_row_count_above.sql
+-- ═══════════════════════════════════════════════════════════════
+
+{% macro assert_row_count_above(model, min_rows) %}
+    {# 
+       Retourne les résultats si le modèle a moins de min_rows lignes.
+       À utiliser comme test singulier ou via run-operation.
+    #}
+    with row_count as (
+        select count(*) as cnt
+        from {{ model }}
+    )
+    select cnt
+    from row_count
+    where cnt < {{ min_rows }}
+{% endmacro %}
+```
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO : pivoter des colonnes (version simplifiée de dbt_utils.pivot)
+-- Fichier : macros/simple_pivot.sql
+-- ═══════════════════════════════════════════════════════════════
+
+{% macro simple_pivot(column, values, agg='sum', value_column='amount') %}
+    {# 
+       Pivot simple : transforme des lignes en colonnes.
+       
+       Arguments :
+         - column (str)        : colonne contenant les valeurs à pivoter
+         - values (list)       : liste des valeurs distinctes attendues
+         - agg (str)           : fonction d'agrégation (sum, count, avg, max, min)
+         - value_column (str)  : colonne à agréger
+       
+       Exemple :
+         {{ simple_pivot('status', ['pending', 'completed', 'cancelled']) }}
+         
+       Génère :
+         sum(case when status = 'pending' then amount else 0 end) as pending_amount,
+         sum(case when status = 'completed' then amount else 0 end) as completed_amount,
+         sum(case when status = 'cancelled' then amount else 0 end) as cancelled_amount
+    #}
+
+    {% for value in values %}
+        {{ agg }}(
+            case
+                when {{ column }} = '{{ value }}'
+                then {{ value_column }}
+                else 0
+            end
+        ) as {{ value }}_{{ value_column }}
+        {%- if not loop.last %},{% endif %}
+    {% endfor %}
+
+{% endmacro %}
+```
+
+```sql
+-- Utilisation :
+select
+    customer_id,
+    {{ simple_pivot(
+        column='order_status',
+        values=['pending', 'completed', 'cancelled'],
+        agg='count',
+        value_column='order_id'
+    ) }}
+from {{ ref('stg_orders') }}
+group by customer_id
+
+-- Compilé en →
+-- count(case when order_status = 'pending' then order_id else 0 end) as pending_order_id,
+-- count(case when order_status = 'completed' then order_id else 0 end) as completed_order_id,
+-- count(case when order_status = 'cancelled' then order_id else 0 end) as cancelled_order_id
+```
+
+### 8.10 Macros d'administration — `run-operation`
+
+Certaines macros ne sont pas appelées dans des modèles mais exécutées directement via la commande `dbt run-operation`.
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO : supprimer les schemas temporaires de CI
+-- Fichier : macros/drop_ci_schemas.sql
+-- Appel : dbt run-operation drop_ci_schemas
+-- ═══════════════════════════════════════════════════════════════
+
+{% macro drop_ci_schemas() %}
+    {# 
+       Supprime tous les schemas créés par la CI.
+       Convention : les schemas CI sont préfixés par "dbt_ci_".
+       
+       Utilisé dans le pipeline CI (GitHub Actions) en step de nettoyage.
+    #}
+
+    {% set schemas_query %}
+        -- Requête pour trouver tous les schemas CI
+        select schema_name
+        from information_schema.schemata
+        where schema_name like 'dbt_ci_%'
+    {% endset %}
+
+    -- Exécuter la requête et récupérer les résultats
+    {% set results = run_query(schemas_query) %}
+
+    {% if execute %}
+        {# execute est true uniquement lors de l'exécution réelle (pas à la compilation) #}
+        {% for row in results %}
+            {% set drop_query = "drop schema if exists " ~ row['schema_name'] ~ " cascade" %}
+            {{ log("Dropping schema: " ~ row['schema_name'], info=true) }}
+            {% do run_query(drop_query) %}
+        {% endfor %}
+    {% endif %}
+
+{% endmacro %}
+```
+
+```bash
+# Exécution directe de la macro
+dbt run-operation drop_ci_schemas
+```
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- MACRO : accorder des permissions de lecture
+-- Fichier : macros/grant_select.sql
+-- Appel : dbt run-operation grant_select --args '{"schema": "marts", "role": "analyst"}'
+-- ═══════════════════════════════════════════════════════════════
+
+{% macro grant_select(schema, role) %}
+    {# 
+       Accorde le SELECT sur toutes les tables d'un schema à un rôle.
+       
+       Arguments :
+         - schema (str) : nom du schema
+         - role (str)   : nom du rôle à autoriser
+    #}
+
+    {% set grant_query %}
+        grant usage on schema {{ schema }} to role {{ role }};
+        grant select on all tables in schema {{ schema }} to role {{ role }};
+    {% endset %}
+
+    {{ log("Granting SELECT on " ~ schema ~ " to " ~ role, info=true) }}
+    {% do run_query(grant_query) %}
+
+{% endmacro %}
+```
+
+### 8.11 Les hooks — Exécuter du SQL avant/après
+
+Les hooks permettent d'exécuter du SQL automatiquement avant ou après un modèle, ou au début/fin d'un run complet.
+
+```yaml
+# ═══════════════════════════════════════════════════════════════
+# HOOKS AU NIVEAU DU PROJET — dbt_project.yml
+# ═══════════════════════════════════════════════════════════════
+
+# Exécuté UNE FOIS au début de chaque dbt run/build/test
+on-run-start:
+  - "{{ log('Starting dbt run at ' ~ modules.datetime.datetime.now(), info=true) }}"
+
+# Exécuté UNE FOIS à la fin de chaque dbt run/build/test
+on-run-end:
+  - "grant select on all tables in schema {{ target.schema }} to role analyst"
+  - "{{ log('Finished dbt run', info=true) }}"
+```
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- HOOKS AU NIVEAU D'UN MODÈLE — dans le config()
+-- ═══════════════════════════════════════════════════════════════
+
+{{
+  config(
+    materialized='table',
+
+    -- Exécuté AVANT la création de ce modèle
+    pre_hook=[
+      "{{ log('Building fct_revenue...', info=true) }}"
+    ],
+
+    -- Exécuté APRÈS la création de ce modèle
+    post_hook=[
+      -- Accorder les droits de lecture aux analystes
+      "grant select on {{ this }} to role analyst",
+
+      -- Créer un index pour améliorer les performances de requête
+      "create index if not exists idx_customer on {{ this }} (customer_id)"
+    ]
+  )
+}}
+
+select
+    customer_id,
+    sum(amount) as total_revenue
+from {{ ref('stg_orders') }}
+group by customer_id
+```
+
+```yaml
+# ═══════════════════════════════════════════════════════════════
+# HOOKS AU NIVEAU D'UN DOSSIER — dbt_project.yml
+# ═══════════════════════════════════════════════════════════════
+
+models:
+  mon_projet:
+    marts:
+      # Tous les modèles du dossier marts auront ce post-hook
+      +post-hook:
+        - "grant select on {{ this }} to role analyst"
+```
+
+### 8.12 Variables dbt — `var()`
+
+Les variables dbt sont déclarées dans `dbt_project.yml` et accessibles partout avec `{{ var() }}`.
+
+```yaml
+# ═══════════════════════════════════════════════════════════════
+# DÉCLARATION DES VARIABLES — dbt_project.yml
+# ═══════════════════════════════════════════════════════════════
+
+vars:
+  # Variables globales (accessibles par tout le projet et tous les packages)
+  start_date: '2024-01-01'
+  default_currency: 'EUR'
+  is_ci: false                        # surchargé en CI via --vars
+
+  # Variables spécifiques au projet (inaccessibles par les packages)
+  mon_projet:
+    tax_rate: 0.20
+    excluded_countries: ['XX', 'ZZ']
+
+  # Variables spécifiques à un package installé
+  dbt_utils:
+    surrogate_key_treat_nulls_as_empty_strings: true
+```
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- UTILISATION DANS UN MODÈLE
+-- ═══════════════════════════════════════════════════════════════
+
+select *
+from {{ ref('stg_orders') }}
+where
+    -- var() avec valeur par défaut (recommandé pour la robustesse)
+    order_date >= '{{ var("start_date", "2024-01-01") }}'
+
+    -- var() sans valeur par défaut (erreur si la variable n'existe pas)
+    and currency = '{{ var("default_currency") }}'
+```
+
+```bash
+# Surcharger une variable en ligne de commande
+dbt run --vars '{"start_date": "2023-01-01", "is_ci": true}'
+
+# Surcharger plusieurs variables
+dbt run --vars '{"start_date": "2023-06-01", "excluded_countries": ["FR", "DE"]}'
+```
+
+### 8.13 Objets contextuels disponibles dans Jinja
+
+dbt met à disposition plusieurs objets contextuels dans le Jinja :
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- L'OBJET target — informations sur l'environnement courant
+-- ═══════════════════════════════════════════════════════════════
+
+{# 
+   target.name      → nom du target ('dev', 'staging', 'prod')
+   target.schema    → schema cible ('dbt_dev', 'dbt_prod')
+   target.database  → base de données cible
+   target.type      → type de warehouse ('bigquery', 'snowflake', 'postgres')
+   target.threads   → nombre de threads configurés
+   target.profile_name → nom du profil utilisé
+#}
+
+-- Exemple : un commentaire SQL avec le contexte d'exécution
+-- Environnement : {{ target.name }}, Schema : {{ target.schema }}
+select * from {{ ref('stg_orders') }}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- L'OBJET this — référence au modèle courant (pour les incrémentaux)
+-- ═══════════════════════════════════════════════════════════════
+
+{# 
+   {{ this }}          → nom complet de la table actuelle (database.schema.table)
+   {{ this.schema }}   → schema de la table actuelle
+   {{ this.name }}     → nom de la table actuelle
+   {{ this.database }} → base de données de la table actuelle
+#}
+
+-- Utilisé principalement dans les modèles incrémentaux
+{% if is_incremental() %}
+    where updated_at > (select max(updated_at) from {{ this }})
+{% endif %}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- L'OBJET model — métadonnées du modèle courant
+-- ═══════════════════════════════════════════════════════════════
+
+{# 
+   model.name         → nom du modèle (ex: 'stg_orders')
+   model.tags         → liste des tags du modèle
+   model.config       → configuration du modèle
+   model.description  → description du modèle
+   model.path         → chemin du fichier
+#}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- LES FONCTIONS UTILITAIRES
+-- ═══════════════════════════════════════════════════════════════
+
+{#
+   ref('model_name')                  → référence un autre modèle
+   source('source', 'table')          → référence une source
+   var('name', default)               → accède à une variable
+   env_var('ENV_VAR_NAME', default)   → lit une variable d'environnement
+   is_incremental()                   → true si le modèle est en mode incrémental
+   log('message', info=true)          → écrit dans les logs dbt
+   run_query('sql')                   → exécute une requête et retourne les résultats
+   adapter.dispatch('macro')()        → appelle une macro spécifique à l'adapter
+   execute                            → true pendant l'exécution (false pendant la compilation)
+   modules.datetime.datetime.now()    → date et heure courantes
+   return(value)                      → retourne une valeur depuis une macro
+#}
+```
+
+### 8.14 `run_query` — Exécuter du SQL dans Jinja
+
+`run_query` permet d'exécuter une requête SQL **pendant la phase de compilation** et d'utiliser les résultats dans le Jinja.
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- EXEMPLE : récupérer dynamiquement la liste des valeurs distinctes
+-- ═══════════════════════════════════════════════════════════════
+
+{# Requête pour obtenir les méthodes de paiement existantes #}
+{% set payment_query %}
+    select distinct payment_method
+    from {{ source('ecommerce', 'orders') }}
+    order by payment_method
+{% endset %}
+
+{# Exécuter la requête (seulement si on n'est pas en phase de parsing) #}
+{% if execute %}
+    {% set results = run_query(payment_query) %}
+    {% set payment_methods = results.columns[0].values() %}
+{% else %}
+    {% set payment_methods = [] %}
+{% endif %}
+
+{# Utiliser les résultats pour générer du SQL dynamique #}
+select
+    customer_id,
+    {% for method in payment_methods %}
+        sum(case when payment_method = '{{ method }}' then amount else 0 end)
+            as {{ method | lower | replace(' ', '_') }}_total
+        {% if not loop.last %},{% endif %}
+    {% endfor %}
+from {{ ref('stg_orders') }}
+group by customer_id
+
+{# 
+   ATTENTION : run_query exécute une requête réelle sur le warehouse.
+   - Cela peut être lent si la requête est complexe
+   - Protégez toujours avec {% if execute %} pour éviter les erreurs au parsing
+   - Préférez les listes statiques ({% set list = [...] %}) quand c'est possible
+#}
+```
+
+### 8.15 Récapitulatif — Quand utiliser quoi
+
+| Besoin | Solution Jinja | Exemple |
+|--------|---------------|---------|
+| Référencer un modèle | `{{ ref() }}` | `from {{ ref('stg_orders') }}` |
+| Référencer une source | `{{ source() }}` | `from {{ source('ecommerce', 'orders') }}` |
+| Adapter au warehouse | `{% if target.type == ... %}` | SQL spécifique BigQuery vs Snowflake |
+| Adapter à l'environnement | `{% if target.name == ... %}` | Limiter les données en dev |
+| Paramétrer un modèle | `{{ var() }}` | `where date >= '{{ var("start_date") }}'` |
+| Lire une variable d'env | `{{ env_var() }}` | `{{ env_var('API_KEY') }}` |
+| Réutiliser de la logique SQL | Créer une macro | `{{ cents_to_euros('amount') }}` |
+| Générer du SQL répétitif | Boucle `{% for %}` | Colonnes pivotées dynamiquement |
+| Gérer l'incrémentalité | `{% if is_incremental() %}` | Filtrer les nouvelles données |
+| Exécuter du SQL admin | Macro + `run-operation` | Nettoyage de schemas CI |
+| SQL automatique avant/après | Hooks | `post_hook: "grant select ..."` |
+| Requêter pendant la compilation | `run_query()` | Récupérer des valeurs dynamiques |
+| Factoriser du code SQL | Macro avec paramètres | `{{ safe_divide('a', 'b') }}` |
+
+### 8.16 Erreurs Jinja fréquentes et solutions
+
+```sql
+-- ═══════════════════════════════════════════════════════════════
+-- ERREUR 1 : "undefined" is undefined
+-- ═══════════════════════════════════════════════════════════════
+-- Cause : variable ou macro inexistante
+
+-- ❌ Mauvais : la variable n'existe pas et pas de défaut
+where date >= '{{ var("star_date") }}'                     -- typo !
+
+-- ✅ Correct : bonne orthographe + valeur par défaut
+where date >= '{{ var("start_date", "2024-01-01") }}'
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- ERREUR 2 : virgule en trop dans une boucle
+-- ═══════════════════════════════════════════════════════════════
+-- Cause : pas de vérification de loop.last
+
+-- ❌ Mauvais : virgule après le dernier élément
+{% for col in columns %}
+    {{ col }},                                              -- virgule même au dernier !
+{% endfor %}
+
+-- ✅ Correct : pas de virgule après le dernier
+{% for col in columns %}
+    {{ col }}{% if not loop.last %},{% endif %}
+{% endfor %}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- ERREUR 3 : confusion entre = (Jinja) et == (comparaison)
+-- ═══════════════════════════════════════════════════════════════
+
+-- ❌ Mauvais : = dans une condition (c'est une assignation)
+{% if target.name = 'prod' %}                               -- erreur de syntaxe !
+
+-- ✅ Correct : == pour comparer
+{% if target.name == 'prod' %}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- ERREUR 4 : run_query sans protection execute
+-- ═══════════════════════════════════════════════════════════════
+
+-- ❌ Mauvais : erreur au parsing (avant la connexion au warehouse)
+{% set results = run_query("select 1") %}
+
+-- ✅ Correct : protégé par execute
+{% if execute %}
+    {% set results = run_query("select 1") %}
+{% endif %}
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- ERREUR 5 : oublier les guillemets autour des strings SQL
+-- ═══════════════════════════════════════════════════════════════
+
+{% set status = 'completed' %}
+
+-- ❌ Mauvais : la valeur n'est pas entre guillemets dans le SQL compilé
+where order_status = {{ status }}
+-- Compilé en → where order_status = completed             -- erreur SQL !
+
+-- ✅ Correct : guillemets autour de la valeur
+where order_status = '{{ status }}'
+-- Compilé en → where order_status = 'completed'
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- ASTUCE : utiliser dbt compile pour debugger le Jinja
+-- ═══════════════════════════════════════════════════════════════
+
+-- Compilez le modèle sans l'exécuter :
+-- $ dbt compile --select mon_modele
+--
+-- Puis consultez le SQL compilé dans :
+-- target/compiled/mon_projet/models/.../mon_modele.sql
+--
+-- Vous verrez le SQL PUR sans aucun Jinja, ce qui facilite le debug.
+```
+
 
 ## 9. Packages dbt
 
